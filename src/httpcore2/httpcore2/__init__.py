@@ -37,7 +37,7 @@ from ._exceptions import (
     WriteTimeout,
 )
 from ._models import URL, Origin, Proxy, Request, Response
-from ._ssl import default_ssl_context, system_ssl_context
+from ._ssl import default_ssl_context
 from ._sync import (
     ConnectionInterface,
     ConnectionPool,
@@ -112,7 +112,6 @@ __all__ = [
     "NetworkBackend",
     # util
     "default_ssl_context",
-    "system_ssl_context",
     "SOCKET_OPTION",
     # exceptions
     "ConnectionNotAvailable",
