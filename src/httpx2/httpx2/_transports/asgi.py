@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import contextlib
-import math
 import typing
 from types import TracebackType
-
-import anyio
-import anyio.abc
-from anyio.streams.memory import MemoryObjectReceiveStream
 
 from .._models import Request, Response
 from .._types import AsyncByteStream
 from .base import AsyncBaseTransport
+
+if typing.TYPE_CHECKING:
+    import asyncio
+
+    import anyio.abc
+    import trio
+
+    Event = asyncio.Event | trio.Event
+
 
 _Message = typing.MutableMapping[str, typing.Any]
 _Receive = typing.Callable[[], typing.Awaitable[_Message]]
@@ -21,20 +25,66 @@ _ASGIApp = typing.Callable[[typing.MutableMapping[str, typing.Any], _Receive, _S
 __all__ = ["ASGITransport"]
 
 
+def is_running_trio() -> bool:
+    try:
+        # sniffio is a dependency of trio.
+
+        # See https://github.com/python-trio/trio/issues/2802
+        import sniffio
+
+        if sniffio.current_async_library() == "trio":
+            return True
+    except ImportError:  # pragma: no cover
+        pass
+
+    return False
+
+
+def create_event() -> Event:
+    if is_running_trio():
+        import trio
+
+        return trio.Event()
+
+    import asyncio
+
+    return asyncio.Event()
+
+
 class ASGIResponseStream(AsyncByteStream):
-    def __init__(self, body: MemoryObjectReceiveStream[bytes | Exception], disconnected: anyio.Event) -> None:
+    def __init__(self, body: list[bytes]) -> None:
         self._body = body
-        self._disconnected = disconnected
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        async for part in self._body:
+        yield b"".join(self._body)
+
+
+class ASGIStreamingResponseStream(AsyncByteStream):
+    def __init__(self, disconnected: Event) -> None:
+        import anyio
+
+        self._send, self._receive = anyio.create_memory_object_stream[bytes | Exception]()
+        self._disconnected = disconnected
+
+    async def put(self, part: bytes | Exception) -> None:
+        import anyio
+
+        # The client may close the response before reading the whole body.
+        with contextlib.suppress(anyio.BrokenResourceError):
+            await self._send.send(part)
+
+    def end(self) -> None:
+        self._send.close()
+
+    async def __aiter__(self) -> typing.AsyncIterator[bytes]:
+        async for part in self._receive:
             if isinstance(part, Exception):
                 raise part
             yield part
 
     async def aclose(self) -> None:
         self._disconnected.set()
-        self._body.close()
+        self._receive.close()
 
 
 class ASGITransport(AsyncBaseTransport):
@@ -79,6 +129,11 @@ class ASGITransport(AsyncBaseTransport):
         self._exit_stack: contextlib.AsyncExitStack | None = None
 
     async def __aenter__(self) -> ASGITransport:
+        try:
+            import anyio
+        except ImportError:  # pragma: no cover - anyio is not installed on Emscripten, so the app runs inline
+            return self
+
         async with contextlib.AsyncExitStack() as stack:
             self._task_group = await stack.enter_async_context(anyio.create_task_group())
             # Apps still running when the transport closes, such as unconsumed infinite streams, are cancelled.
@@ -124,13 +179,13 @@ class ASGITransport(AsyncBaseTransport):
         # Response.
         status_code = None
         response_headers = None
-        response_started = anyio.Event()
+        response_started = create_event()
         response_complete = False
-        disconnected = anyio.Event()
+        disconnected = create_event()
         app_exception: Exception | None = None
-        # Without a task group the app runs inline, so the body must be buffered.
-        buffer_size = math.inf if self._task_group is None else 0
-        body_send, body_receive = anyio.create_memory_object_stream[bytes | Exception](buffer_size)
+        task_group = self._task_group
+        body_parts: list[bytes] = []
+        stream = None if task_group is None else ASGIStreamingResponseStream(disconnected)
 
         # ASGI callables.
 
@@ -164,9 +219,10 @@ class ASGITransport(AsyncBaseTransport):
                 more_body = message.get("more_body", False)
 
                 if body and request.method != "HEAD":
-                    # The client may close the response before reading the whole body.
-                    with contextlib.suppress(anyio.BrokenResourceError):
-                        await body_send.send(body)
+                    if stream is None:
+                        body_parts.append(body)
+                    else:
+                        await stream.put(body)
 
                 if not more_body:
                     response_complete = True
@@ -177,24 +233,28 @@ class ASGITransport(AsyncBaseTransport):
             try:
                 await self.app(scope, receive, send)
             except Exception as exc:
-                if self.raise_app_exceptions and not response_started.is_set():
-                    app_exception = exc
+                if self.raise_app_exceptions and stream is not None and response_started.is_set():
+                    await stream.put(exc)
                 elif self.raise_app_exceptions:
-                    with contextlib.suppress(anyio.BrokenResourceError):
-                        await body_send.send(exc)
+                    app_exception = exc
             finally:
-                body_send.close()
+                if stream is not None:
+                    stream.end()
                 response_started.set()
 
-        if self._task_group is None:
+        if task_group is None:
             await run_app()
         else:
-            self._task_group.start_soon(run_app)
+            task_group.start_soon(run_app)
             await response_started.wait()
 
         if app_exception is not None:
-            body_receive.close()
+            if stream is not None:
+                await stream.aclose()
             raise app_exception
 
-        stream = ASGIResponseStream(body_receive, disconnected)
-        return Response(status_code or 500, headers=response_headers or [], stream=stream)
+        return Response(
+            status_code or 500,
+            headers=response_headers or [],
+            stream=ASGIResponseStream(body_parts) if stream is None else stream,
+        )

@@ -182,7 +182,7 @@ Inside `async with`, the transport runs the app in a background task. The respon
 Closing the response sends `http.disconnect` to the app. Apps still running when the client closes are cancelled.
 
 !!! warning "Use `async with` to stream"
-    Without `async with`, the transport has nowhere to run a background task, so it runs the app to completion before returning the response. An endpoint that never finishes will hang.
+    Without `async with`, the transport has nowhere to run a background task, so it runs the app to completion before returning the response. An endpoint that never finishes will hang. The same applies on Emscripten, where `anyio` is not installed.
 
 !!! note "Context variables set by the app stay in the app"
     The app runs in its own task, so context variables it sets are not visible to the caller, the same as with a real server.
