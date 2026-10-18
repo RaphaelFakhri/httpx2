@@ -338,6 +338,21 @@ async def test_asgi_streaming_response_close_disconnects_app() -> None:
 
 
 @pytest.mark.anyio
+async def test_asgi_closing_response_wakes_concurrent_reader() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await anyio.sleep_forever()
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        async with client.stream("GET", "http://www.example.org/") as response:
+            with anyio.fail_after(1):
+                async with anyio.create_task_group() as task_group:
+                    task_group.start_soon(response.aread)
+                    await anyio.wait_all_tasks_blocked()
+                    await response.aclose()
+
+
+@pytest.mark.anyio
 async def test_asgi_running_app_is_cancelled_on_exit() -> None:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         await send({"type": "http.response.start", "status": 200, "headers": []})

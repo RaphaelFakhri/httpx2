@@ -69,7 +69,7 @@ class ASGIStreamingResponseStream(AsyncByteStream):
         import anyio
 
         # The client may close the response before reading the whole body.
-        with contextlib.suppress(anyio.BrokenResourceError):
+        with contextlib.suppress(anyio.BrokenResourceError, anyio.ClosedResourceError):
             await self._send.send(part)
 
     def end(self) -> None:
@@ -83,6 +83,8 @@ class ASGIStreamingResponseStream(AsyncByteStream):
 
     async def aclose(self) -> None:
         self._disconnected.set()
+        # Closing the send side wakes a reader in another task that is waiting for the next chunk.
+        self._send.close()
         self._receive.close()
 
 
