@@ -543,7 +543,8 @@ class WebSocketSession:
                             break
                         # Unfinished message: bufferize
                         if not event.message_finished:
-                            partial_message_fragments.append(event.data)
+                            if event.data:
+                                partial_message_fragments.append(event.data)
                         # Finished message but no buffer: just emit the event
                         elif not partial_message_fragments:
                             partial_message_size = 0
@@ -1116,7 +1117,8 @@ class AsyncWebSocketSession(anyio.AsyncContextManagerMixin):
                             break
                         # Unfinished message: bufferize
                         if not event.message_finished:
-                            partial_message_fragments.append(event.data)
+                            if event.data:
+                                partial_message_fragments.append(event.data)
                         # Finished message but no buffer: just emit the event
                         elif not partial_message_fragments:
                             partial_message_size = 0

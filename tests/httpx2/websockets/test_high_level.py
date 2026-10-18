@@ -20,6 +20,7 @@ FRAGMENTED_MESSAGES = [
     pytest.param(
         [
             wsproto.events.TextMessage("FRAG", message_finished=False),
+            wsproto.events.TextMessage("", message_finished=False),
             wsproto.events.TextMessage("MEN", message_finished=False),
             wsproto.events.TextMessage("TED", message_finished=True),
         ],
@@ -29,6 +30,7 @@ FRAGMENTED_MESSAGES = [
     pytest.param(
         [
             wsproto.events.BytesMessage(b"FRAG", message_finished=False),
+            wsproto.events.BytesMessage(b"", message_finished=False),
             wsproto.events.BytesMessage(b"MEN", message_finished=False),
             wsproto.events.BytesMessage(b"TED", message_finished=True),
         ],
