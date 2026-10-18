@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import typing
+from types import TracebackType
 
 from .._models import Request, Response
 from .._types import AsyncByteStream
@@ -128,8 +129,14 @@ class ASGITransport(AsyncBaseTransport):
         self.client = client
         self._task_group: anyio.abc.TaskGroup | None = None
         self._exit_stack: contextlib.AsyncExitStack | None = None
+        self._open_count = 0
 
     async def __aenter__(self) -> ASGITransport:
+        # Clients sharing this transport share one task group, closed when the last one exits.
+        self._open_count += 1
+        if self._exit_stack is not None:
+            return self
+
         try:
             import anyio
         except ImportError:  # pragma: no cover - anyio is not installed on Emscripten, so the app runs inline
@@ -141,6 +148,16 @@ class ASGITransport(AsyncBaseTransport):
             stack.callback(self._task_group.cancel_scope.cancel)
             self._exit_stack = stack.pop_all()
         return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_value: BaseException | None = None,
+        traceback: TracebackType | None = None,
+    ) -> None:
+        self._open_count -= 1
+        if self._open_count == 0:
+            await self.aclose()
 
     async def aclose(self) -> None:
         if self._exit_stack is not None:

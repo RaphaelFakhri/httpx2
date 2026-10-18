@@ -399,6 +399,17 @@ async def test_asgi_transport_mounted_more_than_once() -> None:
 
 
 @pytest.mark.anyio
+async def test_asgi_transport_shared_by_nested_clients() -> None:
+    transport = httpx2.ASGITransport(app=hello_world)
+    with anyio.CancelScope():
+        async with httpx2.AsyncClient(transport=transport) as outer:
+            async with httpx2.AsyncClient(transport=transport) as inner:
+                assert (await inner.get("http://www.example.org/")).text == "Hello, World!"
+            async with outer.stream("GET", "http://www.example.org/") as response:
+                assert await response.aread() == b"Hello, World!"
+
+
+@pytest.mark.anyio
 async def test_asgi_no_response() -> None:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         pass
