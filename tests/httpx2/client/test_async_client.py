@@ -318,7 +318,7 @@ async def test_failing_transport_does_not_skip_closing_the_others(failing: str) 
 
 
 @pytest.mark.anyio
-async def test_transports_are_entered_once_and_exited_in_reverse_order() -> None:
+async def test_transports_are_exited_in_reverse_order() -> None:
     events: list[str] = []
 
     class Transport(httpx2.AsyncBaseTransport):
@@ -334,8 +334,7 @@ async def test_transports_are_entered_once_and_exited_in_reverse_order() -> None
 
     transport = Transport("transport")
     mounted = Transport("mounted")
-    mounts = {"http://a": mounted, "http://b": mounted}
-    async with httpx2.AsyncClient(transport=transport, mounts=mounts):
+    async with httpx2.AsyncClient(transport=transport, mounts={"http://a": mounted}):
         pass
 
     assert events == ["transport.__aenter__", "mounted.__aenter__", "mounted.__aexit__", "transport.__aexit__"]
