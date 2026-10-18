@@ -2204,8 +2204,9 @@ class AsyncClient(BaseClient):
             self._state = ClientState.CLOSED
 
             async with AsyncExitStack() as stack:
-                for transport in self._unique_transports:
-                    stack.push_async_callback(transport.aclose)
+                for transport in (self._transport, *self._mounts.values()):
+                    if transport is not None:
+                        stack.push_async_callback(transport.aclose)
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:
@@ -2218,8 +2219,9 @@ class AsyncClient(BaseClient):
         self._state = ClientState.OPENED
 
         async with AsyncExitStack() as stack:
-            for transport in self._unique_transports:
-                await stack.enter_async_context(transport)
+            for transport in (self._transport, *self._mounts.values()):
+                if transport is not None:
+                    await stack.enter_async_context(transport)
             self._exit_stack = stack.pop_all()
         return self
 
@@ -2232,9 +2234,3 @@ class AsyncClient(BaseClient):
         self._state = ClientState.CLOSED
 
         await self._exit_stack.__aexit__(exc_type, exc_value, traceback)
-
-    @property
-    def _unique_transports(self) -> list[AsyncBaseTransport]:
-        # A transport mounted under several patterns must be entered and closed once.
-        transports = (self._transport, *self._mounts.values())
-        return list({id(transport): transport for transport in transports if transport is not None}.values())
