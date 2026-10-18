@@ -7,7 +7,7 @@ import time
 import typing
 import warnings
 from collections.abc import AsyncGenerator, Generator
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from types import TracebackType
 
 from .__version__ import __version__
@@ -1523,6 +1523,7 @@ class AsyncClient(BaseClient):
         if mounts is not None:
             self._mounts.update({URLPattern(key): transport for key, transport in mounts.items()})
         self._mounts = dict(sorted(self._mounts.items()))
+        self._exit_stack = AsyncExitStack()
 
     def _init_transport(
         self,
@@ -2202,10 +2203,9 @@ class AsyncClient(BaseClient):
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            for proxy in reversed(self._mounts.values()):
-                if proxy is not None:
-                    await proxy.aclose()
-            await self._transport.aclose()
+            async with AsyncExitStack() as stack:
+                for transport in self._unique_transports:
+                    stack.push_async_callback(transport.aclose)
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:
@@ -2217,10 +2217,10 @@ class AsyncClient(BaseClient):
 
         self._state = ClientState.OPENED
 
-        await self._transport.__aenter__()
-        for proxy in self._mounts.values():
-            if proxy is not None:
-                await proxy.__aenter__()
+        async with AsyncExitStack() as stack:
+            for transport in self._unique_transports:
+                await stack.enter_async_context(transport)
+            self._exit_stack = stack.pop_all()
         return self
 
     async def __aexit__(
@@ -2231,8 +2231,10 @@ class AsyncClient(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        # Exit in reverse order, as transports may hold nested task groups.
-        for proxy in reversed(self._mounts.values()):
-            if proxy is not None:
-                await proxy.__aexit__(exc_type, exc_value, traceback)
-        await self._transport.__aexit__(exc_type, exc_value, traceback)
+        await self._exit_stack.__aexit__(exc_type, exc_value, traceback)
+
+    @property
+    def _unique_transports(self) -> list[AsyncBaseTransport]:
+        # A transport mounted under several patterns must be entered and closed once.
+        transports = (self._transport, *self._mounts.values())
+        return list({id(transport): transport for transport in transports if transport is not None}.values())

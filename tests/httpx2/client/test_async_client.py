@@ -289,6 +289,32 @@ async def test_context_managed_transport_and_mount() -> None:
     ]
 
 
+@pytest.mark.anyio
+async def test_failing_mount_does_not_skip_closing_other_transports() -> None:
+    class Transport(httpx2.AsyncBaseTransport):
+        def __init__(self, fail: bool = False) -> None:
+            self.fail = fail
+            self.closed = False
+
+        async def aclose(self) -> None:
+            self.closed = True
+            if self.fail:
+                raise RuntimeError("mount failed to close")
+
+    transport = Transport()
+    mounted = Transport(fail=True)
+    with pytest.raises(RuntimeError, match="mount failed to close"):
+        async with httpx2.AsyncClient(transport=transport, mounts={"http://www.example.org": mounted}):
+            pass
+    assert transport.closed
+
+    transport = Transport()
+    client = httpx2.AsyncClient(transport=transport, mounts={"http://www.example.org": Transport(fail=True)})
+    with pytest.raises(RuntimeError, match="mount failed to close"):
+        await client.aclose()
+    assert transport.closed
+
+
 def hello_world(request: httpx2.Request) -> httpx2.Response:
     return httpx2.Response(200, text="Hello, world!")
 

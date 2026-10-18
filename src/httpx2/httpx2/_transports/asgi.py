@@ -225,7 +225,7 @@ class ASGITransport(AsyncBaseTransport):
             nonlocal app_exception
             try:
                 await self.app(scope, receive, send)
-                if response_started.is_set() and not response_complete:
+                if not response_complete:
                     raise RuntimeError("The ASGI app returned without completing the response.")
             except Exception as exc:
                 if self.raise_app_exceptions and stream is not None and response_started.is_set():

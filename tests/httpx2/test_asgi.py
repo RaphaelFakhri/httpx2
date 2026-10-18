@@ -366,6 +366,26 @@ async def test_asgi_mounted_transports() -> None:
 
 
 @pytest.mark.anyio
+async def test_asgi_transport_mounted_more_than_once() -> None:
+    transport = httpx2.ASGITransport(app=echo_path)
+    mounts = {"http://a": transport, "http://b": transport}
+    with anyio.CancelScope():
+        async with httpx2.AsyncClient(transport=transport, mounts=mounts) as client:
+            assert (await client.get("http://a/a")).json() == {"path": "/a"}
+            assert (await client.get("http://b/b")).json() == {"path": "/b"}
+
+
+@pytest.mark.anyio
+async def test_asgi_no_response() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        pass
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        with pytest.raises(RuntimeError, match="without completing the response"):
+            await client.get("http://www.example.org/")
+
+
+@pytest.mark.anyio
 async def test_asgi_incomplete_response() -> None:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         await send({"type": "http.response.start", "status": 200, "headers": []})
