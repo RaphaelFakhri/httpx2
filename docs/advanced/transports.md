@@ -142,6 +142,8 @@ See [the ASGI documentation](https://asgi.readthedocs.io/en/latest/specs/www.htm
 
 ### Streaming responses
 
+The ASGI transport streams response bodies, so you can test server-sent events and other endpoints that send data over time. This app sends three events, one per second, and the client prints each one as it arrives:
+
 ```python
 import asyncio
 
@@ -175,7 +177,7 @@ async def main():
 asyncio.run(main())
 ```
 
-Inside `async with`, the transport runs the app in a background task. The response is returned as soon as the app sends its status and headers, and each body chunk arrives as the app sends it. This is what lets you test server-sent events and other endpoints that never finish.
+Inside `async with`, the transport runs the app in a background task. The response is returned as soon as the app sends its status and headers, and each body chunk arrives as the app sends it.
 
 Closing the response sends `http.disconnect` to the app. Apps still running when the client closes are cancelled.
 
