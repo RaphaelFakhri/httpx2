@@ -289,30 +289,56 @@ async def test_context_managed_transport_and_mount() -> None:
     ]
 
 
+@pytest.mark.parametrize("failing", ["transport", "mounted"])
 @pytest.mark.anyio
-async def test_failing_mount_does_not_skip_closing_other_transports() -> None:
+async def test_failing_transport_does_not_skip_closing_the_others(failing: str) -> None:
     class Transport(httpx2.AsyncBaseTransport):
-        def __init__(self, fail: bool = False) -> None:
+        def __init__(self, fail: bool) -> None:
             self.fail = fail
             self.closed = False
 
         async def aclose(self) -> None:
             self.closed = True
             if self.fail:
-                raise RuntimeError("mount failed to close")
+                raise RuntimeError("failed to close")
 
-    transport = Transport()
-    mounted = Transport(fail=True)
-    with pytest.raises(RuntimeError, match="mount failed to close"):
+    transport = Transport(fail=failing == "transport")
+    mounted = Transport(fail=failing == "mounted")
+    with pytest.raises(RuntimeError, match="failed to close"):
         async with httpx2.AsyncClient(transport=transport, mounts={"http://www.example.org": mounted}):
             pass
-    assert transport.closed
+    assert transport.closed and mounted.closed
 
-    transport = Transport()
-    client = httpx2.AsyncClient(transport=transport, mounts={"http://www.example.org": Transport(fail=True)})
-    with pytest.raises(RuntimeError, match="mount failed to close"):
+    transport = Transport(fail=failing == "transport")
+    mounted = Transport(fail=failing == "mounted")
+    client = httpx2.AsyncClient(transport=transport, mounts={"http://www.example.org": mounted})
+    with pytest.raises(RuntimeError, match="failed to close"):
         await client.aclose()
-    assert transport.closed
+    assert transport.closed and mounted.closed
+
+
+@pytest.mark.anyio
+async def test_transports_are_entered_once_and_exited_in_reverse_order() -> None:
+    events: list[str] = []
+
+    class Transport(httpx2.AsyncBaseTransport):
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def __aenter__(self) -> Transport:
+            events.append(f"{self.name}.__aenter__")
+            return self
+
+        async def __aexit__(self, *args: typing.Any) -> None:
+            events.append(f"{self.name}.__aexit__")
+
+    transport = Transport("transport")
+    mounted = Transport("mounted")
+    mounts = {"http://a": mounted, "http://b": mounted}
+    async with httpx2.AsyncClient(transport=transport, mounts=mounts):
+        pass
+
+    assert events == ["transport.__aenter__", "mounted.__aenter__", "mounted.__aexit__", "transport.__aexit__"]
 
 
 def hello_world(request: httpx2.Request) -> httpx2.Response:
