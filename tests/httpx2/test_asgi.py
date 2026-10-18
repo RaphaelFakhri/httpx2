@@ -343,13 +343,21 @@ async def test_asgi_closing_response_wakes_concurrent_reader() -> None:
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await anyio.sleep_forever()
 
+    read_done = anyio.Event()
+
+    async def read(response: httpx2.Response) -> None:
+        await response.aread()
+        read_done.set()
+
     async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
         async with client.stream("GET", "http://www.example.org/") as response:
-            with anyio.fail_after(1):
-                async with anyio.create_task_group() as task_group:
-                    task_group.start_soon(response.aread)
-                    await anyio.wait_all_tasks_blocked()
-                    await response.aclose()
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(read, response)
+                await anyio.wait_all_tasks_blocked()
+                assert not read_done.is_set()
+                await response.aclose()
+                with anyio.fail_after(1):
+                    await read_done.wait()
 
 
 @pytest.mark.anyio
