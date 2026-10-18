@@ -1,18 +1,17 @@
 from __future__ import annotations
 
+import contextlib
+import math
 import typing
+from types import TracebackType
+
+import anyio
+import anyio.abc
+from anyio.streams.memory import MemoryObjectReceiveStream
 
 from .._models import Request, Response
 from .._types import AsyncByteStream
 from .base import AsyncBaseTransport
-
-if typing.TYPE_CHECKING:
-    import asyncio
-
-    import trio
-
-    Event = asyncio.Event | trio.Event
-
 
 _Message = typing.MutableMapping[str, typing.Any]
 _Receive = typing.Callable[[], typing.Awaitable[_Message]]
@@ -22,38 +21,20 @@ _ASGIApp = typing.Callable[[typing.MutableMapping[str, typing.Any], _Receive, _S
 __all__ = ["ASGITransport"]
 
 
-def is_running_trio() -> bool:
-    try:
-        # sniffio is a dependency of trio.
-
-        # See https://github.com/python-trio/trio/issues/2802
-        import sniffio
-
-        if sniffio.current_async_library() == "trio":
-            return True
-    except ImportError:  # pragma: no cover
-        pass
-
-    return False
-
-
-def create_event() -> Event:
-    if is_running_trio():
-        import trio
-
-        return trio.Event()
-
-    import asyncio
-
-    return asyncio.Event()
-
-
 class ASGIResponseStream(AsyncByteStream):
-    def __init__(self, body: list[bytes]) -> None:
+    def __init__(self, body: MemoryObjectReceiveStream[bytes | Exception], disconnected: anyio.Event) -> None:
         self._body = body
+        self._disconnected = disconnected
 
     async def __aiter__(self) -> typing.AsyncIterator[bytes]:
-        yield b"".join(self._body)
+        async for part in self._body:
+            if isinstance(part, Exception):
+                raise part
+            yield part
+
+    async def aclose(self) -> None:
+        self._disconnected.set()
+        self._body.close()
 
 
 class ASGITransport(AsyncBaseTransport):
@@ -66,8 +47,13 @@ class ASGITransport(AsyncBaseTransport):
         root_path="/submount",
         client=("1.2.3.4", 123)
     )
-    client = httpx2.AsyncClient(transport=transport)
+    async with httpx2.AsyncClient(transport=transport) as client:
+        ...
     ```
+
+    Inside `async with`, the app runs in a task owned by the transport, and the response
+    is returned as soon as the app sends `http.response.start`, so the body can be streamed.
+    Outside of it, the app runs to completion before the response is returned.
 
     Arguments:
         app: The ASGI application.
@@ -89,6 +75,28 @@ class ASGITransport(AsyncBaseTransport):
         self.raise_app_exceptions = raise_app_exceptions
         self.root_path = root_path
         self.client = client
+        self._task_group: anyio.abc.TaskGroup | None = None
+        self._exit_stack: contextlib.AsyncExitStack | None = None
+
+    async def __aenter__(self) -> ASGITransport:
+        async with contextlib.AsyncExitStack() as stack:
+            self._task_group = await stack.enter_async_context(anyio.create_task_group())
+            # Apps still running when the transport closes, such as unconsumed infinite streams, are cancelled.
+            stack.callback(self._task_group.cancel_scope.cancel)
+            self._exit_stack = stack.pop_all()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None = None,
+        exc_val: BaseException | None = None,
+        exc_tb: TracebackType | None = None,
+    ) -> None:
+        if self._exit_stack is not None:
+            await self._exit_stack.__aexit__(exc_type, exc_val, exc_tb)
+            self._task_group = None
+            self._exit_stack = None
+        await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def handle_async_request(self, request: Request) -> Response:
         assert isinstance(request.stream, AsyncByteStream)
@@ -116,9 +124,13 @@ class ASGITransport(AsyncBaseTransport):
         # Response.
         status_code = None
         response_headers = None
-        body_parts: list[bytes] = []
-        response_started = False
-        response_complete = create_event()
+        response_started = anyio.Event()
+        response_complete = False
+        disconnected = anyio.Event()
+        app_exception: Exception | None = None
+        # Without a task group the app runs inline, so the body must be buffered.
+        buffer_size = math.inf if self._task_group is None else 0
+        body_send, body_receive = anyio.create_memory_object_stream[bytes | Exception](buffer_size)
 
         # ASGI callables.
 
@@ -126,7 +138,7 @@ class ASGITransport(AsyncBaseTransport):
             nonlocal request_complete
 
             if request_complete:
-                await response_complete.wait()
+                await disconnected.wait()
                 return {"type": "http.disconnect"}
 
             try:
@@ -137,42 +149,52 @@ class ASGITransport(AsyncBaseTransport):
             return {"type": "http.request", "body": body, "more_body": True}
 
         async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
-            nonlocal status_code, response_headers, response_started
+            nonlocal status_code, response_headers, response_complete
 
             if message["type"] == "http.response.start":
-                assert not response_started
+                assert not response_started.is_set()
 
                 status_code = message["status"]
                 response_headers = message.get("headers", [])
-                response_started = True
+                response_started.set()
 
             elif message["type"] == "http.response.body":
-                assert not response_complete.is_set()
+                assert not response_complete
                 body = message.get("body", b"")
                 more_body = message.get("more_body", False)
 
                 if body and request.method != "HEAD":
-                    body_parts.append(body)
+                    # The client may close the response before reading the whole body.
+                    with contextlib.suppress(anyio.BrokenResourceError):
+                        await body_send.send(body)
 
                 if not more_body:
-                    response_complete.set()
+                    response_complete = True
+                    disconnected.set()
 
-        try:
-            await self.app(scope, receive, send)
-        except Exception:
-            if self.raise_app_exceptions:
-                raise
+        async def run_app() -> None:
+            nonlocal app_exception
+            try:
+                await self.app(scope, receive, send)
+            except Exception as exc:
+                if self.raise_app_exceptions and not response_started.is_set():
+                    app_exception = exc
+                elif self.raise_app_exceptions:
+                    with contextlib.suppress(anyio.BrokenResourceError):
+                        await body_send.send(exc)
+            finally:
+                body_send.close()
+                response_started.set()
 
-            response_complete.set()
-            if status_code is None:
-                status_code = 500
-            if response_headers is None:
-                response_headers = {}
+        if self._task_group is None:
+            await run_app()
+        else:
+            self._task_group.start_soon(run_app)
+            await response_started.wait()
 
-        assert response_complete.is_set()
-        assert status_code is not None
-        assert response_headers is not None
+        if app_exception is not None:
+            body_receive.close()
+            raise app_exception
 
-        stream = ASGIResponseStream(body_parts)
-
-        return Response(status_code, headers=response_headers, stream=stream)
+        stream = ASGIResponseStream(body_receive, disconnected)
+        return Response(status_code or 500, headers=response_headers or [], stream=stream)

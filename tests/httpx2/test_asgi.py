@@ -1,7 +1,13 @@
+import contextlib
 import json
 import typing
 
+import anyio
 import pytest
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import StreamingResponse
+from starlette.routing import Route
 
 import httpx2
 
@@ -224,3 +230,123 @@ async def test_asgi_exc_no_raise() -> None:
         response = await client.get("http://www.example.org/")
 
         assert response.status_code == 500
+
+
+@pytest.mark.anyio
+async def test_asgi_exc_without_context_manager() -> None:
+    client = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=raise_exc))
+    with pytest.raises(RuntimeError):
+        await client.get("http://www.example.org/")
+
+
+@pytest.mark.anyio
+async def test_asgi_without_context_manager_buffers_response() -> None:
+    disconnected = False
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        nonlocal disconnected
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"Hello, ", "more_body": True})
+        await send({"type": "http.response.body", "body": b"World!"})
+        while (await receive())["type"] == "http.request":
+            pass
+        disconnected = True
+
+    client = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app))
+    response = await client.get("http://www.example.org/")
+
+    assert disconnected
+    assert response.text == "Hello, World!"
+
+
+@pytest.mark.anyio
+async def test_asgi_exc_after_response_start() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        raise RuntimeError()
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        async with client.stream("GET", "http://www.example.org/") as response:
+            assert response.status_code == 200
+            with pytest.raises(RuntimeError):
+                await response.aread()
+
+
+@pytest.mark.anyio
+async def test_asgi_exc_no_raise_after_response_start() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+        raise RuntimeError()
+
+    transport = httpx2.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx2.AsyncClient(transport=transport) as client:
+        response = await client.get("http://www.example.org/")
+
+    assert response.status_code == 200
+    assert response.text == "partial"
+
+
+@pytest.mark.anyio
+async def test_asgi_streaming_response() -> None:
+    chunks = iter([b"first", b"second"])
+    next_chunk = anyio.Event()
+
+    async def stream() -> typing.AsyncIterator[bytes]:
+        yield next(chunks)
+        await next_chunk.wait()
+        yield next(chunks)
+
+    async def endpoint(request: Request) -> StreamingResponse:
+        return StreamingResponse(stream())
+
+    app = Starlette(routes=[Route("/", endpoint)])
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        with anyio.fail_after(1):
+            async with client.stream("GET", "http://www.example.org/") as response:
+                parts = response.aiter_bytes()
+                assert await anext(parts) == b"first"
+                next_chunk.set()
+                assert await anext(parts) == b"second"
+                with pytest.raises(StopAsyncIteration):
+                    await anext(parts)
+
+
+@pytest.mark.anyio
+async def test_asgi_streaming_response_close_disconnects_app() -> None:
+    disconnected = anyio.Event()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        async with anyio.create_task_group() as task_group:
+
+            async def send_forever() -> None:
+                while True:
+                    await send({"type": "http.response.body", "body": b"chunk", "more_body": True})
+
+            task_group.start_soon(send_forever)
+            while (await receive())["type"] == "http.request":
+                pass
+            disconnected.set()
+            task_group.cancel_scope.cancel()
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        with anyio.fail_after(1):
+            async with client.stream("GET", "http://www.example.org/") as response:
+                async with contextlib.aclosing(response.aiter_bytes()) as parts:
+                    assert await anext(parts) == b"chunk"
+            await disconnected.wait()
+
+
+@pytest.mark.anyio
+async def test_asgi_unclosed_infinite_stream_is_cancelled_on_exit() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await anyio.sleep_forever()
+
+    with anyio.fail_after(1):
+        async with httpx2.ASGITransport(app=app) as transport:
+            response = await transport.handle_async_request(httpx2.Request("GET", "http://www.example.org/"))
+            assert response.status_code == 200
+            await response.aclose()
