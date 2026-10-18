@@ -410,6 +410,35 @@ async def test_asgi_receive_disconnect_after_response_before_request_body() -> N
 
 
 @pytest.mark.anyio
+async def test_asgi_response_closed_while_reading_request_body() -> None:
+    upload_paused = anyio.Event()
+    resume_upload = anyio.Event()
+    message_after_close: Message = {}
+    app_done = anyio.Event()
+
+    async def upload() -> typing.AsyncIterator[bytes]:
+        yield b"first"
+        upload_paused.set()
+        await resume_upload.wait()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        nonlocal message_after_close
+        await receive()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        message_after_close = await receive()
+        app_done.set()
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        with anyio.fail_after(1):
+            async with client.stream("POST", "http://www.example.org/", content=upload()):
+                await upload_paused.wait()
+            resume_upload.set()
+            await app_done.wait()
+
+    assert message_after_close == {"type": "http.disconnect"}
+
+
+@pytest.mark.anyio
 async def test_asgi_cancelled_before_response_start_disconnects_app() -> None:
     start_response = anyio.Event()
     app_done = anyio.Event()

@@ -193,8 +193,11 @@ class ASGITransport(AsyncBaseTransport):
                 body = await request_body_chunks.__anext__()
             except StopAsyncIteration:
                 request_complete = True
-                return {"type": "http.request", "body": b"", "more_body": False}
-            return {"type": "http.request", "body": body, "more_body": True}
+                body = b""
+            # The response may have been closed while waiting for the request body.
+            if disconnected.is_set():
+                return {"type": "http.disconnect"}
+            return {"type": "http.request", "body": body, "more_body": not request_complete}
 
         async def send(message: typing.MutableMapping[str, typing.Any]) -> None:
             nonlocal status_code, response_headers, response_complete
