@@ -229,6 +229,8 @@ class ASGITransport(AsyncBaseTransport):
                 response_started.set()
 
             elif message["type"] == "http.response.body":
+                if not response_started.is_set():
+                    raise RuntimeError("The ASGI app sent a response body before starting the response.")
                 assert not response_complete
                 body = message.get("body", b"")
                 more_body = message.get("more_body", False)
@@ -246,14 +248,20 @@ class ASGITransport(AsyncBaseTransport):
         async def run_app() -> None:
             nonlocal app_exception
             try:
-                await self.app(scope, receive, send)
-                if not response_complete:
-                    raise RuntimeError("The ASGI app returned without completing the response.")
-            except Exception as exc:
-                if self.raise_app_exceptions and stream is not None and response_started.is_set():
-                    await stream.put(exc)
-                elif self.raise_app_exceptions:
-                    app_exception = exc
+                error: Exception | None = None
+                try:
+                    await self.app(scope, receive, send)
+                except Exception as exc:
+                    if self.raise_app_exceptions:
+                        error = exc
+                else:
+                    # An incomplete response is a protocol error, raised even when app exceptions are not.
+                    if not response_complete:
+                        error = RuntimeError("The ASGI app returned without completing the response.")
+                if error is not None and stream is not None and response_started.is_set():
+                    await stream.put(error)
+                elif error is not None:
+                    app_exception = error
             finally:
                 if stream is not None:
                     stream.end()

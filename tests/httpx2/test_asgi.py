@@ -409,6 +409,28 @@ async def test_asgi_transport_shared_by_nested_clients() -> None:
                 assert await response.aread() == b"Hello, World!"
 
 
+@pytest.mark.parametrize("raise_app_exceptions", [True, False])
+@pytest.mark.anyio
+async def test_asgi_incomplete_response_raises_regardless_of_raise_app_exceptions(raise_app_exceptions: bool) -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    transport = httpx2.ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions)
+    async with httpx2.AsyncClient(transport=transport) as client:
+        with pytest.raises(RuntimeError, match="without completing the response"):
+            await client.get("http://www.example.org/")
+
+
+@pytest.mark.anyio
+async def test_asgi_body_before_response_start() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.body", "body": b"too early"})
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        with anyio.fail_after(1), pytest.raises(RuntimeError, match="before starting the response"):
+            await client.get("http://www.example.org/")
+
+
 @pytest.mark.anyio
 async def test_asgi_no_response() -> None:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
