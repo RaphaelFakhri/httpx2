@@ -338,7 +338,7 @@ async def test_asgi_streaming_response_close_disconnects_app() -> None:
 
 
 @pytest.mark.anyio
-async def test_asgi_unclosed_infinite_stream_is_cancelled_on_exit() -> None:
+async def test_asgi_running_app_is_cancelled_on_exit() -> None:
     async def app(scope: Scope, receive: Receive, send: Send) -> None:
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await anyio.sleep_forever()
