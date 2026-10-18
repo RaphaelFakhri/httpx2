@@ -248,9 +248,7 @@ async def test_asgi_without_context_manager_buffers_response() -> None:
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"Hello, ", "more_body": True})
         await send({"type": "http.response.body", "body": b"World!"})
-        while (await receive())["type"] == "http.request":
-            pass
-        disconnected = True
+        disconnected = (await receive())["type"] == "http.disconnect"
 
     client = httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app))
     response = await client.get("http://www.example.org/")
@@ -350,3 +348,61 @@ async def test_asgi_unclosed_infinite_stream_is_cancelled_on_exit() -> None:
             response = await transport.handle_async_request(httpx2.Request("GET", "http://www.example.org/"))
             assert response.status_code == 200
             await response.aclose()
+
+
+@pytest.mark.anyio
+async def test_asgi_exception_in_client_context_is_not_wrapped() -> None:
+    with pytest.raises(KeyError):
+        async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=hello_world)):
+            raise KeyError()
+
+
+@pytest.mark.anyio
+async def test_asgi_mounted_transports() -> None:
+    mounts = {"http://mounted": httpx2.ASGITransport(app=echo_path)}
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=hello_world), mounts=mounts) as client:
+        assert (await client.get("http://www.example.org/")).text == "Hello, World!"
+        assert (await client.get("http://mounted/path")).json() == {"path": "/path"}
+
+
+@pytest.mark.anyio
+async def test_asgi_incomplete_response() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"partial", "more_body": True})
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        with pytest.raises(RuntimeError, match="without completing the response"):
+            await client.get("http://www.example.org/")
+
+
+@pytest.mark.anyio
+async def test_asgi_receive_disconnect_after_response_before_request_body() -> None:
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await send({"type": "http.response.start", "status": 413, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+        assert (await receive())["type"] == "http.disconnect"
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        response = await client.post("http://www.example.org/", content=b"unread")
+
+    assert response.status_code == 413
+
+
+@pytest.mark.anyio
+async def test_asgi_cancelled_before_response_start_disconnects_app() -> None:
+    start_response = anyio.Event()
+    app_done = anyio.Event()
+
+    async def app(scope: Scope, receive: Receive, send: Send) -> None:
+        await start_response.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"late"})
+        app_done.set()
+
+    async with httpx2.AsyncClient(transport=httpx2.ASGITransport(app=app)) as client:
+        with anyio.move_on_after(0.01):
+            await client.get("http://www.example.org/")
+        start_response.set()
+        with anyio.fail_after(1):
+            await app_done.wait()

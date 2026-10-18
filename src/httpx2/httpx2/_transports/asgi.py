@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import typing
-from types import TracebackType
 
 from .._models import Request, Response
 from .._types import AsyncByteStream
@@ -141,17 +140,11 @@ class ASGITransport(AsyncBaseTransport):
             self._exit_stack = stack.pop_all()
         return self
 
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None = None,
-        exc_val: BaseException | None = None,
-        exc_tb: TracebackType | None = None,
-    ) -> None:
+    async def aclose(self) -> None:
         if self._exit_stack is not None:
-            await self._exit_stack.__aexit__(exc_type, exc_val, exc_tb)
+            await self._exit_stack.aclose()
             self._task_group = None
             self._exit_stack = None
-        await super().__aexit__(exc_type, exc_val, exc_tb)
 
     async def handle_async_request(self, request: Request) -> Response:
         assert isinstance(request.stream, AsyncByteStream)
@@ -192,7 +185,7 @@ class ASGITransport(AsyncBaseTransport):
         async def receive() -> dict[str, typing.Any]:
             nonlocal request_complete
 
-            if request_complete:
+            if request_complete or disconnected.is_set():
                 await disconnected.wait()
                 return {"type": "http.disconnect"}
 
@@ -232,6 +225,8 @@ class ASGITransport(AsyncBaseTransport):
             nonlocal app_exception
             try:
                 await self.app(scope, receive, send)
+                if response_started.is_set() and not response_complete:
+                    raise RuntimeError("The ASGI app returned without completing the response.")
             except Exception as exc:
                 if self.raise_app_exceptions and stream is not None and response_started.is_set():
                     await stream.put(exc)
@@ -245,8 +240,15 @@ class ASGITransport(AsyncBaseTransport):
         if task_group is None:
             await run_app()
         else:
+            import anyio
+
+            assert stream is not None
             task_group.start_soon(run_app)
-            await response_started.wait()
+            try:
+                await response_started.wait()
+            except anyio.get_cancelled_exc_class():
+                await stream.aclose()
+                raise
 
         if app_exception is not None:
             if stream is not None:

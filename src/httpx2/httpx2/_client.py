@@ -2202,10 +2202,10 @@ class AsyncClient(BaseClient):
         if self._state != ClientState.CLOSED:
             self._state = ClientState.CLOSED
 
-            await self._transport.aclose()
-            for proxy in self._mounts.values():
+            for proxy in reversed(self._mounts.values()):
                 if proxy is not None:
                     await proxy.aclose()
+            await self._transport.aclose()
 
     async def __aenter__(self: U) -> U:
         if self._state != ClientState.UNOPENED:
@@ -2231,7 +2231,8 @@ class AsyncClient(BaseClient):
     ) -> None:
         self._state = ClientState.CLOSED
 
-        await self._transport.__aexit__(exc_type, exc_value, traceback)
-        for proxy in self._mounts.values():
+        # Exit in reverse order, as transports may hold nested task groups.
+        for proxy in reversed(self._mounts.values()):
             if proxy is not None:
                 await proxy.__aexit__(exc_type, exc_value, traceback)
+        await self._transport.__aexit__(exc_type, exc_value, traceback)
